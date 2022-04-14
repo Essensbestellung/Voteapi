@@ -1,7 +1,8 @@
 use actix::prelude::*; // Addr
 use actix_redis::{Command, RedisActor};
 use actix_web::{error, web, HttpResponse};
-use redis_async::{resp::FromResp, resp_array};
+use futures_util::future::try_join_all;
+use redis_async::{error::Error, resp::FromResp, resp::RespValue, resp_array};
 extern crate serde_json;
 //use serde_json::Result;
 
@@ -16,7 +17,7 @@ pub async fn cast_vote(
 ) -> actix_web::Result<HttpResponse> {
     // Deserialize the Request Body
     let vote = req_body.into_inner();
-    let key = vote.name;
+    let key = vote.name.clone();
 
     let one = redis.send(Command(resp_array!["SISMEMBER", "voters", &key]));
     log::info!("Checking if {} has already voted", &key);
@@ -42,7 +43,7 @@ pub async fn cast_vote(
     }
 
     // let result_order = redis.send(Command(resp_array!["SET", &key, &vote.order.to_string()]));
-    let s_order = serde_json::to_string(&vote.order).unwrap();
+    let s_order = serde_json::to_string(&vote).unwrap();
     let i_expire = 7 * 60 * 60;
     let result_order = redis.send(Command(resp_array![
         "SET",
@@ -105,18 +106,48 @@ pub async fn get_result(redis: web::Data<Addr<RedisActor>>) -> actix_web::Result
     log::info!("Following Members found: {:?}", vec_res);
 
     //Simple Voting result order gets ignored all votes are equal
+    let mut vec_future_votes = Vec::new();
+    for voter in vec_res {
+        vec_future_votes.push(redis.send(Command(resp_array!["GET", voter])))
+    }
 
-    // Get the votes of every member and push to Vec
-    let res = vec_res.iter().map(|voter| {
-        log::info!("Voter: {}", voter);
-    });
+    let res = try_join_all(vec_future_votes)
+        .await
+        .map_err(error::ErrorInternalServerError)?
+        .into_iter()
+        .map(|item| {
+            let i: String = FromResp::from_resp(item.map_err(error::ErrorInternalServerError)?)
+                .map_err(error::ErrorInternalServerError)?;
+            serde_json::from_str(&i).map_err(error::ErrorInternalServerError)
+        })
+        .collect::<Result<Vec<model::Vote>, _>>()?;
 
-    // let res = try_join_all([one, two, three])
-    // .await
-    // .map_err(error::ErrorInternalServerError)?
-    // .into_iter()
-    // .map(|item| item.map_err(error::ErrorInternalServerError))
-    // .collect::<Result<Vec<_>, _>>()?;
+    log::info!("{:?}", res);
+
+    // loop over cast votes
+    // if element not in tally add to it else add one to the rooster
+    let mut ret = model::Result {
+        timestamp: 0,
+        elements: vec![],
+    };
+    for votes in res {
+        for vote in votes.order {
+            let opt = ret.elements.iter_mut().find(|x| *x == &vote.name);
+            match opt {
+                Some(_) => {
+                    // log::info!("{} already in list tally up", &opt.unwrap().name);
+                    let res = opt.unwrap();
+                    res.votes += 1;
+                    log::info!("{} already in list tally up", res.name);
+                }
+                None => ret.elements.push(model::ResultElement {
+                    votes: 0,
+                    name: vote.name.clone(),
+                }),
+                _ => (),
+            }
+        }
+    }
 
     Ok(HttpResponse::Ok().body("Need to calculate Result"))
 }
